@@ -6,10 +6,11 @@ local DEFAULT_TCP_PORT = 65370 -- enable TChannel dissecting for a port
 -- creates Proto objects
 local tch_proto = Proto("tchannel", "TChannel Frame Header")
 local tch_callreq_proto = Proto("tchannel-callreq", "TChannel Call Request")
+local tch_thrift_proto = Proto("tchannel-thrift", "TChannel Thrift Scheme")
 
--- a function to convert tables of enumerated types to value-string tables
+-- a function to convert enum table to a map of enum strings by enum
 -- i.e., from { "name" = number } to { number = "name" }
-local function enumTableToValStringTable(enumTable)
+local function toEnumStringByEnum(enumTable)
     local t = {}
     for name,num in pairs(enumTable) do
         t[num] = name
@@ -19,17 +20,17 @@ end
 
 local frametype = {
     NONE							=	0,
-		INIT_REQ					=	1,
-		INIT_RES					=	2,
-		CALL_REQ					= 3,
-		CALL_RES					= 4,
-		CALL_REQ_CONTINUE = 5,
-		CALL_RES_CONTINUE = 6,
-		PING_REQ					= 7,
-		PING_RES					= 8,
-		ERROR							= 9,
+		INIT_REQ					=	0x01,
+		INIT_RES					=	0x02,
+		CALL_REQ					= 0x03,
+		CALL_RES					= 0x04,
+		CALL_REQ_CONTINUE = 0x13,
+		CALL_RES_CONTINUE = 0x14,
+		PING_REQ					= 0xd0,
+		PING_RES					= 0xd1,
+		ERROR							= 0xFF,
 }
-local frametype_valstr = enumTableToValStringTable(frametype)
+local frametype_valstr = toEnumStringByEnum(frametype)
 
 local csumtype = {
     NONE										=	0,
@@ -37,7 +38,16 @@ local csumtype = {
     FRAMHASH_FINGERPRINT32	=	2,
     CRC32C									=	3,
 }
-local csumtype_valstr = enumTableToValStringTable(csumtype)
+local csumtype_valstr = toEnumStringByEnum(csumtype)
+
+local astype = {
+	NONE = 0,
+	THRIFT = 1,
+	STHRIFT = 2,
+	JSON = 3,
+	HTTP = 4,
+	RAW = 5,
+}
 
 ----------------------------------------
 -- TChannel frame headers
@@ -56,20 +66,32 @@ local tch_callreq =
     flags = ProtoField.uint8("flags", "Flags", base.DEC),
     ttl = ProtoField.uint32 ("ttl", "TTL", base.DEC),
     tracing = ProtoField.bytes("tracing", "Tracing", base.COLON),
-    svc_len = ProtoField.uint8("svc_len", "Service Len", base.DEC),
-    svc = ProtoField.string("svc_len", "Service", base.UNICODE),
-    nth = ProtoField.uint8("nth", "num_headers", base.DEC),
+    svc = ProtoField.string("svc", "Service", base.UNICODE),
+    nth = ProtoField.uint8("nth", "Num of Headers", base.DEC),
     csum_type = ProtoField.uint8("csum_type", "Checksum Type", base.DEC, csumtype_valstr),
-    csum = ProtoField.uint32 ("csum", "Checksum", base.DEC),
+    csum = ProtoField.uint32 ("csum", "Checksum", base.HEX),
+		as = ProtoField.string("arg_scheme", "Arg Scheme", base.UNICODE),
+		cn = ProtoField.string("caller", "Caller Name", base.UNICODE),
+		th = ProtoField.string("transport_header", "Other Transport Header", base.UNICODE),
+}
+
+-- TChannel Thrift Arg Scheme
+local tch_thrift =
+{
+    arg1 = ProtoField.string("arg1", "Arg1", base.UNICODE),
+    arg2 = ProtoField.string("arg2", "Arg2 Header", base.UNICODE),
+    arg3 = ProtoField.bytes("arg3", "Arg3", base.COLON),
 }
 
 -- register the ProtoFields
 tch_proto.fields = tch_frame_hdr
 tch_callreq_proto.fields = tch_callreq
+tch_thrift_proto.fields = tch_thrift
 
 -- forward declarations of helper functions
 local dissectTChFrameHeader
 local dissectTChCallReq
+local dissectTChThrift
 local createSllTvb
 local checkTChFrameLength
 local get_range_helper
@@ -158,6 +180,7 @@ function dissectTChFrameHeader(tvbuf, pktinfo, root, offset)
 		local msgtype_val  = string.format(": %s", frametype_valstr[msgtype_tvbr:uint()])
 		pktinfo.cols.info:append(msgtype_val)
 
+		local has_thrift = false
 		--- start to dissect payload based on frame type
 		if msgtype_tvbr:uint() == frametype.CALL_REQ then
 			dissectTChCallReq(tvbuf, pktinfo, root, offset+TCH_FRAME_HEADER_SIZE, length_val-TCH_FRAME_HEADER_SIZE)
@@ -169,6 +192,7 @@ end
 -- offset points at buffer after frame header.
 -- frame_sz is the length after frame header.
 dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
+		local start_offset = offset
     -- We start by adding our protocol to the dissection display tree.
     local tree = root:add(tch_callreq_proto, tvbuf:range(offset, frame_sz))
 
@@ -192,18 +216,37 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 		local nth_tvbr, offset = get_range_helper(tvbuf, offset, 1)
     tree:add(tch_callreq.nth, nth_tvbr)
 
+		local has_tch_thrift = false
 		-- dissect the transport header fields
 		local nth_val = nth_tvbr:uint()
+		local other_th = {}
 		for i=1, nth_val,1
 			do
+				local required_transport_hdrs = {
+					as = tch_callreq.as,
+					cn = tch_callreq.cn,
+				}
+
 				local k_tvbr, v_tvbr, new_offset = transportHeaderDissect(tvbuf, offset)
-				-- we just add transport headers into the proto field now
-				-- TODO: do some research to see if it has better support for
-				-- random lenght of k/v pairs.
-				local kv = string.format(" %s:%s", k_tvbr:string(), v_tvbr:string())
-				tree:append_text(kv)
+				local hdr_field = required_transport_hdrs[k_tvbr:string()]
+				if hdr_field then
+					tree:add(hdr_field, v_tvbr)
+				else
+					local kv = string.format("%s:%s", k_tvbr:string(), v_tvbr:string())
+					-- insert other transport headers later so that we always show
+					-- Arg Scheme or Caller Name first.
+					table.insert(other_th, kv)
+				end
 				offset = new_offset
+
+				if (k_tvbr:string() == "as") and (v_tvbr:string() == "thrift") then
+					has_tch_thrift = true
+				end
 			end
+
+		for k, v in pairs(other_th) do
+			tree:add(tch_callreq.th, v)
+		end
 
 		-- dissect checksum type and checksum.
 		local csum_type_tvbr, offset = get_range_helper(tvbuf, offset, 1)
@@ -213,6 +256,43 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 			tree:add(tch_callreq.csum, csum_tvbr)
 			offset = new_offset
 		end
+
+		-- update the length properly before tch_thrift
+		local parsed = offset-start_offset
+		tree:set_len(parsed)
+
+		if has_tch_thrift == true then
+			dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz-parsed)
+		end
+end
+
+function dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz)
+    -- We start by adding our protocol to the dissection display tree.
+    local tree = root:add(tch_thrift_proto, tvbuf:range(offset, frame_sz))
+
+		-- dissect the Arg1
+		local arg1_tvbr, offset = get_var_helper(tvbuf, offset, 2)
+		tree:add(tch_thrift.arg1, arg1_tvbr)
+
+		-- dissect the Arg2
+		-- TODO: add safety check to handle corrupted packets.
+		local arg2_len_tvbr, offset = get_range_helper(tvbuf, offset, 2)
+		local arg2_count_tvbr, offset = get_range_helper(tvbuf, offset, 2)
+		local arg2_count = arg2_count_tvbr:uint()
+		for i=1, arg2_count, 1
+			do
+				-- TODO: not sure if it's a good idea to present arg2 kv as string.
+				local key_tvbr, val_tvbr, new_offset = get_kv_helper(tvbuf, offset, 2, 2)
+				tree:add(tch_thrift.arg2, string.format("%s:%s", key_tvbr:string(), val_tvbr:string()))
+				offset = new_offset
+			end
+
+		-- dissect the Arg3
+		-- TODO: add safety check to handle corrupted packets.
+		local arg3_len_tvbr, offset = get_range_helper(tvbuf, offset, 2)
+		local arg3_val_tvbr, offset = get_range_helper(tvbuf, offset, arg3_len_tvbr:uint())
+		tree:add(tch_thrift.arg3, arg3_val_tvbr)
+
 end
 
 ----------------------------------------
