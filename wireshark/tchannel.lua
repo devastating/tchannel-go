@@ -7,6 +7,7 @@ local DEFAULT_TCP_PORT = 65370 -- enable TChannel dissecting for a port
 local tch_proto = Proto("tchannel", "TChannel Frame Header")
 local tch_callreq_proto = Proto("tchannel-callreq", "TChannel Call Request")
 local tch_thrift_proto = Proto("tchannel-thrift", "TChannel Thrift Scheme")
+local tch_raw_proto = Proto("tchannel-raw", "TChannel Raw Scheme")
 
 -- a function to convert enum table to a map of enum strings by enum
 -- i.e., from { "name" = number } to { number = "name" }
@@ -83,15 +84,21 @@ local tch_thrift =
     arg3 = ProtoField.bytes("arg3", "Arg3", base.COLON),
 }
 
+local raw_args = {
+	arg = ProtoField.bytes("arg", "Arg", base.COLON),
+}
+
 -- register the ProtoFields
 tch_proto.fields = tch_frame_hdr
 tch_callreq_proto.fields = tch_callreq
 tch_thrift_proto.fields = tch_thrift
+tch_raw_proto.fields = raw_args
 
 -- forward declarations of helper functions
 local dissectTChFrameHeader
 local dissectTChCallReq
 local dissectTChThrift
+local dissectTChRaw
 local createSllTvb
 local checkTChFrameLength
 local get_range_helper
@@ -216,7 +223,7 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 		local nth_tvbr, offset = get_range_helper(tvbuf, offset, 1)
     tree:add(tch_callreq.nth, nth_tvbr)
 
-		local has_tch_thrift = false
+		local arg_scheme = nil
 		-- dissect the transport header fields
 		local nth_val = nth_tvbr:uint()
 		local other_th = {}
@@ -239,8 +246,8 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 				end
 				offset = new_offset
 
-				if (k_tvbr:string() == "as") and (v_tvbr:string() == "thrift") then
-					has_tch_thrift = true
+				if (k_tvbr:string() == "as") then
+					arg_scheme = v_tvbr:string()
 				end
 			end
 
@@ -261,8 +268,12 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 		local parsed = offset-start_offset
 		tree:set_len(parsed)
 
-		if has_tch_thrift == true then
+		-- TODO: we only process non-fragmented call for thrift for now
+		-- since we only have the info for which arg is which.
+		if (arg_scheme == "thrift") and (flags_tvbr:uint() == 0) then
 			dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz-parsed)
+		elseif arg_scheme == "raw" then
+			dissectTChRaw(tvbuf, pktinfo, root, offset, frame_sz-parsed)
 		end
 end
 
@@ -292,7 +303,23 @@ function dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz)
 		local arg3_len_tvbr, offset = get_range_helper(tvbuf, offset, 2)
 		local arg3_val_tvbr, offset = get_range_helper(tvbuf, offset, arg3_len_tvbr:uint())
 		tree:add(tch_thrift.arg3, arg3_val_tvbr)
+end
 
+function dissectTChRaw(tvbuf, pktinfo, root, offset, frame_sz)
+    -- We start by adding our protocol to the dissection display tree.
+    local tree = root:add(tch_raw_proto, tvbuf:range(offset, frame_sz))
+
+		-- dissect the Args
+		local end_offset = offset + frame_sz
+		while offset < end_offset do
+			local arg1_len_tvbr, new_offset = get_range_helper(tvbuf, offset, 2)
+			offset = new_offset
+			if arg1_len_tvbr:uint() > 0 then
+				local arg1_val_tvbr, new_offset = get_range_helper(tvbuf, offset, arg1_len_tvbr:uint())
+				tree:add(raw_args.arg, arg1_val_tvbr)
+				offset = new_offset
+			end
+		end
 end
 
 ----------------------------------------
