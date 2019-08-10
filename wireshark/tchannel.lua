@@ -5,6 +5,8 @@ local DEFAULT_TCP_PORT = 65370 -- enable TChannel dissecting for a port
 
 -- creates Proto objects
 local tch_proto = Proto("tchannel", "TChannel Frame Header")
+local tch_initreq_proto = Proto("tchannel-initreq", "TChannel Init Request")
+local tch_initres_proto = Proto("tchannel-initres", "TChannel Init Response")
 local tch_callreq_proto = Proto("tchannel-callreq", "TChannel Call Request")
 local tch_callreq_continue_proto = Proto("tchannel-callreq-continue", "TChannel Call Request Continue")
 local tch_thrift_proto = Proto("tchannel-thrift", "TChannel Thrift Scheme")
@@ -62,6 +64,23 @@ local tch_frame_hdr =
     reservedP1 = ProtoField.uint64 ("tch.reserved", "Reserved", base.DEC),
 }
 
+-- TChannel InitReq fields
+local tch_initreq =
+{
+    version = ProtoField.uint16("version", "Version", base.DEC),
+    nh = ProtoField.uint16("nh", "Num of Headers", base.DEC),
+    key = ProtoField.string("key", "Key", base.UNICODE),
+    val = ProtoField.string("value", "Value", base.UNICODE),
+}
+
+local tch_initres =
+{
+    version = ProtoField.uint16("version", "Version", base.DEC),
+    nh = ProtoField.uint16("nh", "Num of Headers", base.DEC),
+    key = ProtoField.string("key", "Key", base.UNICODE),
+    val = ProtoField.string("value", "Value", base.UNICODE),
+}
+
 -- TChannel CallReq fields
 local tch_callreq =
 {
@@ -100,6 +119,8 @@ local raw_args = {
 
 -- register the ProtoFields
 tch_proto.fields = tch_frame_hdr
+tch_initreq_proto.fields = tch_initreq
+tch_initres_proto.fields = tch_initres
 tch_callreq_proto.fields = tch_callreq
 tch_callreq_continue_proto.fields = tch_callreq_continue
 tch_thrift_proto.fields = tch_thrift
@@ -107,6 +128,7 @@ tch_raw_proto.fields = raw_args
 
 -- forward declarations of helper functions
 local dissectTChFrameHeader
+local dissectTChInitReqRes
 local dissectTChCallReq
 local dissectTChCallReqContinue
 local dissectTChThrift
@@ -212,9 +234,35 @@ function dissectTChFrameHeader(tvbuf, pktinfo, root, offset)
 			dissectTChCallReq(tvbuf, pktinfo, root, next_offset, left_length)
 		elseif msgtype_tvbr:uint() == frametype.CALL_REQ_CONTINUE then
 			dissectTChCallReqContinue(tvbuf, pktinfo, root, next_offset, left_length)
+		elseif msgtype_tvbr:uint() == frametype.INIT_REQ then
+			dissectTChInitReqRes(tch_initreq_proto, tvbuf, pktinfo, root, next_offset, left_length)
+		elseif msgtype_tvbr:uint() == frametype.INIT_RES then
+			dissectTChInitReqRes(tch_initres_proto, tvbuf, pktinfo, root, next_offset, left_length)
 		end
 
     return length_val
+end
+
+-- same dissector for INIT_REQ and INIT_RES
+function dissectTChInitReqRes(proto, tvbuf, pktinfo, root, offset, frame_sz)
+    local tree = root:add(proto, tvbuf:range(offset, frame_sz))
+		-- dissect version
+		local ver_tvbr, offset = get_range_helper(tvbuf, offset, 2)
+    tree:add(tch_initreq.version, ver_tvbr)
+
+		-- dissect number of headers
+		local nh_tvbr, offset = get_range_helper(tvbuf, offset, 2)
+    tree:add(tch_initreq.nh, nh_tvbr)
+
+		-- dissect kv headers
+		local nh = nh_tvbr:uint()
+		for i=1, nh, 1
+			do
+				local key_tvbr, val_tvbr, new_offset = get_kv_helper(tvbuf, offset, 2, 2)
+				tree:add(tch_initreq.key, key_tvbr)
+				tree:add(tch_initreq.val, val_tvbr)
+				offset = new_offset
+			end
 end
 
 -- offset points at buffer after frame header.
