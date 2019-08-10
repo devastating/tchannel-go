@@ -82,10 +82,7 @@ local tch_initreq =
 
 local tch_initres =
 {
-    version = ProtoField.uint16("version", "Version", base.DEC),
-    nh = ProtoField.uint16("nh", "Num of Headers", base.DEC),
-    key = ProtoField.string("key", "Key", base.UNICODE),
-    val = ProtoField.string("value", "Value", base.UNICODE),
+	-- Share the same fields with tch_initreq
 }
 
 -- TChannel CallReq fields
@@ -106,9 +103,7 @@ local tch_callreq =
 -- TChannel CallReq Continue fields
 local tch_callreq_continue =
 {
-    flags = ProtoField.uint8("flags", "Flags", base.DEC),
-    csum_type = ProtoField.uint8("csum_type", "Checksum Type", base.DEC, csumtype_valstr),
-    csum = ProtoField.uint32 ("csum", "Checksum", base.HEX),
+		-- Share fields with tch_callreq
     continuation = ProtoField.bytes("continuation", "Continuation", base.COLON),
 }
 
@@ -367,11 +362,11 @@ function dissectTChCallReqContinue(tvbuf, pktinfo, root, offset, frame_sz)
     local tree = root:add(tch_callreq_continue_proto, tvbuf:range(offset, frame_sz))
     -- dissect the flag field
 		local flags_tvbr, offset = get_range_helper(tvbuf, offset, 1)
-    tree:add(tch_callreq_continue.flags, flags_tvbr)
+    tree:add(tch_callreq.flags, flags_tvbr)
 
 		-- dissect checksum type and value
 		local csum_type_tvbr, csum_tvbr, offset = dissectChecksum(tvbuf, offset)
-		tree:add(tch_callreq_continue.csum_type, csum_type_tvbr)
+		tree:add(tch_callreq.csum_type, csum_type_tvbr)
 		if csum_tvbr ~= nil then
 			tree:add(tch_callreq.csum, csum_tvbr)
 		end
