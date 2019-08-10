@@ -6,6 +6,7 @@ local DEFAULT_TCP_PORT = 65370 -- enable TChannel dissecting for a port
 -- creates Proto objects
 local tch_proto = Proto("tchannel", "TChannel Frame Header")
 local tch_callreq_proto = Proto("tchannel-callreq", "TChannel Call Request")
+local tch_callreq_continue_proto = Proto("tchannel-callreq-continue", "TChannel Call Request Continue")
 local tch_thrift_proto = Proto("tchannel-thrift", "TChannel Thrift Scheme")
 local tch_raw_proto = Proto("tchannel-raw", "TChannel Raw Scheme")
 
@@ -71,9 +72,18 @@ local tch_callreq =
     nth = ProtoField.uint8("nth", "Num of Headers", base.DEC),
     csum_type = ProtoField.uint8("csum_type", "Checksum Type", base.DEC, csumtype_valstr),
     csum = ProtoField.uint32 ("csum", "Checksum", base.HEX),
-		as = ProtoField.string("arg_scheme", "Arg Scheme", base.UNICODE),
-		cn = ProtoField.string("caller", "Caller Name", base.UNICODE),
-		th = ProtoField.string("transport_header", "Other Transport Header", base.UNICODE),
+    as = ProtoField.string("arg_scheme", "Arg Scheme", base.UNICODE),
+    cn = ProtoField.string("caller", "Caller Name", base.UNICODE),
+    th = ProtoField.string("transport_header", "Other Transport Header", base.UNICODE),
+}
+
+-- TChannel CallReq Continue fields
+local tch_callreq_continue =
+{
+    flags = ProtoField.uint8("flags", "Flags", base.DEC),
+    csum_type = ProtoField.uint8("csum_type", "Checksum Type", base.DEC, csumtype_valstr),
+    csum = ProtoField.uint32 ("csum", "Checksum", base.HEX),
+    continuation = ProtoField.bytes("continuation", "Continuation", base.COLON),
 }
 
 -- TChannel Thrift Arg Scheme
@@ -91,14 +101,17 @@ local raw_args = {
 -- register the ProtoFields
 tch_proto.fields = tch_frame_hdr
 tch_callreq_proto.fields = tch_callreq
+tch_callreq_continue_proto.fields = tch_callreq_continue
 tch_thrift_proto.fields = tch_thrift
 tch_raw_proto.fields = raw_args
 
 -- forward declarations of helper functions
 local dissectTChFrameHeader
 local dissectTChCallReq
+local dissectTChCallReqContinue
 local dissectTChThrift
 local dissectTChRaw
+local dissectChecksum
 local createSllTvb
 local checkTChFrameLength
 local get_range_helper
@@ -180,6 +193,10 @@ function dissectTChFrameHeader(tvbuf, pktinfo, root, offset)
     local msgtype_tvbr = tvbuf:range(offset + 2, 1)
     tree:add(tch_frame_hdr.msg_type, msgtype_tvbr)
 
+    -- dissect the message ID field
+    local msgid_tvbr = tvbuf:range(offset + 4, 4)
+    tree:add(tch_frame_hdr.id, msgid_tvbr)
+
     -- dissect the length field
     tree:add(tch_frame_hdr.size, length_tvbr)
 
@@ -188,9 +205,13 @@ function dissectTChFrameHeader(tvbuf, pktinfo, root, offset)
 		pktinfo.cols.info:append(msgtype_val)
 
 		local has_thrift = false
+		local next_offset = offset+TCH_FRAME_HEADER_SIZE
+		local left_length = length_val-TCH_FRAME_HEADER_SIZE
 		--- start to dissect payload based on frame type
 		if msgtype_tvbr:uint() == frametype.CALL_REQ then
-			dissectTChCallReq(tvbuf, pktinfo, root, offset+TCH_FRAME_HEADER_SIZE, length_val-TCH_FRAME_HEADER_SIZE)
+			dissectTChCallReq(tvbuf, pktinfo, root, next_offset, left_length)
+		elseif msgtype_tvbr:uint() == frametype.CALL_REQ_CONTINUE then
+			dissectTChCallReqContinue(tvbuf, pktinfo, root, next_offset, left_length)
 		end
 
     return length_val
@@ -256,12 +277,10 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 		end
 
 		-- dissect checksum type and checksum.
-		local csum_type_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+		local csum_type_tvbr, csum_tvbr, offset = dissectChecksum(tvbuf, offset)
 		tree:add(tch_callreq.csum_type, csum_type_tvbr)
-		if csum_type_tvbr:uint() ~= csumtype.NONE then
-			local csum_tvbr, new_offset = get_range_helper(tvbuf, offset, 4)
+		if csum_tvbr ~= nil then
 			tree:add(tch_callreq.csum, csum_tvbr)
-			offset = new_offset
 		end
 
 		-- update the length properly before tch_thrift
@@ -275,6 +294,34 @@ dissectTChCallReq = function (tvbuf, pktinfo, root, offset, frame_sz)
 		elseif arg_scheme == "raw" then
 			dissectTChRaw(tvbuf, pktinfo, root, offset, frame_sz-parsed)
 		end
+end
+
+function dissectTChCallReqContinue(tvbuf, pktinfo, root, offset, frame_sz)
+		local start_offset = offset
+    local tree = root:add(tch_callreq_continue_proto, tvbuf:range(offset, frame_sz))
+    -- dissect the flag field
+		local flags_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+    tree:add(tch_callreq_continue.flags, flags_tvbr)
+
+		-- dissect checksum type and value
+		local csum_type_tvbr, csum_tvbr, offset = dissectChecksum(tvbuf, offset)
+		tree:add(tch_callreq_continue.csum_type, csum_type_tvbr)
+		if csum_tvbr ~= nil then
+			tree:add(tch_callreq.csum, csum_tvbr)
+		end
+
+		local continuation_tvbr, offset = get_range_helper(tvbuf, offset, frame_sz-(offset-start_offset))
+		tree:add(tch_callreq_continue.continuation, continuation_tvbr)
+end
+
+function dissectChecksum(tvbuf, offset)
+		local csum_type_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+		if csum_type_tvbr:uint() ~= csumtype.NONE then
+			local csum_tvbr, new_offset = get_range_helper(tvbuf, offset, 4)
+			return csum_type_tvbr, csum_tvbr, new_offset
+		end
+
+		return csum_type_tvbr, nil, offset
 end
 
 function dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz)
