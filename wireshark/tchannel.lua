@@ -9,6 +9,7 @@ local tch_initreq_proto = Proto("tchannel-initreq", "TChannel Init Request")
 local tch_initres_proto = Proto("tchannel-initres", "TChannel Init Response")
 local tch_callreq_proto = Proto("tchannel-callreq", "TChannel Call Request")
 local tch_callreq_continue_proto = Proto("tchannel-callreq-continue", "TChannel Call Request Continue")
+local tch_callres_proto = Proto("tchannel-callres", "TChannel Call Response")
 local tch_thrift_proto = Proto("tchannel-thrift", "TChannel Thrift Scheme")
 local tch_raw_proto = Proto("tchannel-raw", "TChannel Raw Scheme")
 
@@ -43,6 +44,12 @@ local csumtype = {
     CRC32C									=	3,
 }
 local csumtype_valstr = toEnumStringByEnum(csumtype)
+
+local rescode = {
+	OK = 0x0,
+	Error = 0x1,
+}
+local rescode_valstr = toEnumStringByEnum(rescode)
 
 local astype = {
 	NONE = 0,
@@ -105,6 +112,13 @@ local tch_callreq_continue =
     continuation = ProtoField.bytes("continuation", "Continuation", base.COLON),
 }
 
+-- TChannel CallRes fields
+-- Most of the fields are sharing with CallReq.
+local tch_callres =
+{
+    code = ProtoField.uint8("code", "Code", base.DEC, rescode_valstr),
+}
+
 -- TChannel Thrift Arg Scheme
 local tch_thrift =
 {
@@ -123,6 +137,7 @@ tch_initreq_proto.fields = tch_initreq
 tch_initres_proto.fields = tch_initres
 tch_callreq_proto.fields = tch_callreq
 tch_callreq_continue_proto.fields = tch_callreq_continue
+tch_callres_proto.fields = tch_callres
 tch_thrift_proto.fields = tch_thrift
 tch_raw_proto.fields = raw_args
 
@@ -131,6 +146,7 @@ local dissectTChFrameHeader
 local dissectTChInitReqRes
 local dissectTChCallReq
 local dissectTChCallReqContinue
+local dissectTChCallRes
 local dissectTChThrift
 local dissectTChRaw
 local dissectChecksum
@@ -234,6 +250,8 @@ function dissectTChFrameHeader(tvbuf, pktinfo, root, offset)
 			dissectTChCallReq(tvbuf, pktinfo, root, next_offset, left_length)
 		elseif msgtype_tvbr:uint() == frametype.CALL_REQ_CONTINUE then
 			dissectTChCallReqContinue(tvbuf, pktinfo, root, next_offset, left_length)
+		elseif msgtype_tvbr:uint() == frametype.CALL_RES then
+			dissectTChCallRes(tvbuf, pktinfo, root, next_offset, left_length)
 		elseif msgtype_tvbr:uint() == frametype.INIT_REQ then
 			dissectTChInitReqRes(tch_initreq_proto, tvbuf, pktinfo, root, next_offset, left_length)
 		elseif msgtype_tvbr:uint() == frametype.INIT_RES then
@@ -360,6 +378,79 @@ function dissectTChCallReqContinue(tvbuf, pktinfo, root, offset, frame_sz)
 
 		local continuation_tvbr, offset = get_range_helper(tvbuf, offset, frame_sz-(offset-start_offset))
 		tree:add(tch_callreq_continue.continuation, continuation_tvbr)
+end
+
+dissectTChCallRes = function (tvbuf, pktinfo, root, offset, frame_sz)
+		local start_offset = offset
+    -- We start by adding our protocol to the dissection display tree.
+    local tree = root:add(tch_callres_proto, tvbuf:range(offset, frame_sz))
+
+    -- dissect the flag field
+		local flags_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+    tree:add(tch_callreq.flags, flags_tvbr)
+
+    -- dissect the code field
+		local code_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+    tree:add(tch_callres.code, code_tvbr)
+
+    -- dissect the tracing field
+		local tracing_tvbr, offset = get_range_helper(tvbuf, offset, 25)
+    tree:add(tch_callreq.tracing, tracing_tvbr)
+
+    -- dissect the nth field
+		local nth_tvbr, offset = get_range_helper(tvbuf, offset, 1)
+    tree:add(tch_callreq.nth, nth_tvbr)
+
+		local arg_scheme = nil
+		-- dissect the transport header fields
+		local nth_val = nth_tvbr:uint()
+		local other_th = {}
+		for i=1, nth_val,1
+			do
+				local required_transport_hdrs = {
+					as = tch_callreq.as,
+					cn = tch_callreq.cn,
+				}
+
+				local k_tvbr, v_tvbr, new_offset = transportHeaderDissect(tvbuf, offset)
+				local hdr_field = required_transport_hdrs[k_tvbr:string()]
+				if hdr_field then
+					tree:add(hdr_field, v_tvbr)
+				else
+					local kv = string.format("%s:%s", k_tvbr:string(), v_tvbr:string())
+					-- insert other transport headers later so that we always show
+					-- Arg Scheme or Caller Name first.
+					table.insert(other_th, kv)
+				end
+				offset = new_offset
+
+				if (k_tvbr:string() == "as") then
+					arg_scheme = v_tvbr:string()
+				end
+			end
+
+		for k, v in pairs(other_th) do
+			tree:add(tch_callreq.th, v)
+		end
+
+		-- dissect checksum type and checksum.
+		local csum_type_tvbr, csum_tvbr, offset = dissectChecksum(tvbuf, offset)
+		tree:add(tch_callreq.csum_type, csum_type_tvbr)
+		if csum_tvbr ~= nil then
+			tree:add(tch_callreq.csum, csum_tvbr)
+		end
+
+		-- update the length properly before tch_thrift
+		local parsed = offset-start_offset
+		tree:set_len(parsed)
+
+		-- TODO: we only process non-fragmented call for thrift for now
+		-- since we only have the info for which arg is which.
+		if (arg_scheme == "thrift") and (flags_tvbr:uint() == 0) then
+			dissectTChThrift(tvbuf, pktinfo, root, offset, frame_sz-parsed)
+		elseif arg_scheme == "raw" then
+			dissectTChRaw(tvbuf, pktinfo, root, offset, frame_sz-parsed)
+		end
 end
 
 function dissectChecksum(tvbuf, offset)
